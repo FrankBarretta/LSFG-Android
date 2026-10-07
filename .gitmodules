@@ -1,7 +1,0 @@
-[submodule "lsfg-vk-android"]
-	path = lsfg-vk-android
-	url = https://github.com/FrankBarretta/lsfg-vk-android.git
-	branch = release
-[submodule "LSFG-Android-Application"]
-	path = LSFG-Android-Application
-	url = https://github.com/FrankBarretta/LSFG-Android-Application.git
