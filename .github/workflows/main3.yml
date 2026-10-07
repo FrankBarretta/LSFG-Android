@@ -1,0 +1,111 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "Build type"
+        type: choice
+        options: [debug, release]
+        default: debug
+      version_name:
+        description: "Version name (empty = from gradle)"
+        type: string
+        default: ""
+      publish_release:
+        description: "Create a GitHub Release with the APK"
+        type: boolean
+        default: false
+      prerelease:
+        description: "Mark the release as pre-release"
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: write
+
+env:
+  BUILD_TYPE: ${{ inputs.build_type || 'debug' }}
+  NDK_VERSION: "27.2.12479018"
+  CMAKE_VERSION: "3.22.1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # sdkmanager is not on PATH on this runner, so locate it (or download cmdline-tools) explicitly.
+      - name: Install NDK + CMake
+        run: |
+          ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          mkdir -p "$ROOT"
+          SDKM=$(ls "$ROOT"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n1 || true)
+          if [ -z "$SDKM" ]; then
+            echo "cmdline-tools not found, downloading"
+            curl -fsSL -o "$RUNNER_TEMP/cmdtools.zip" https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q "$RUNNER_TEMP/cmdtools.zip" -d "$RUNNER_TEMP/cmdtools"
+            mkdir -p "$ROOT/cmdline-tools"
+            mv "$RUNNER_TEMP/cmdtools/cmdline-tools" "$ROOT/cmdline-tools/latest"
+            SDKM="$ROOT/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          echo "Using $SDKM (SDK root $ROOT)"
+          yes | "$SDKM" --sdk_root="$ROOT" --licenses > /dev/null || true
+          "$SDKM" --sdk_root="$ROOT" "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}" "platforms;android-35" "build-tools;35.0.0"
+          echo "ANDROID_HOME=$ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ROOT" >> "$GITHUB_ENV"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Decode release keystore (optional)
+        if: env.BUILD_TYPE == 'release' && env.KEYSTORE_BASE64 != ''
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          TASK=assembleDebug
+          [ "$BUILD_TYPE" = "release" ] && TASK=assembleRelease
+          VN="${{ inputs.version_name }}"
+          ARGS=""
+          [ -n "$VN" ] && ARGS="-PversionName=$VN"
+          gradle :app:$TASK $ARGS --stacktrace
+
+      - name: Rename APK
+        id: apk
+        run: |
+          SRC=$(ls app/build/outputs/apk/$BUILD_TYPE/*.apk | head -n1)
+          NAME="FrameGen-${BUILD_TYPE}-${GITHUB_RUN_NUMBER}.apk"
+          cp "$SRC" "$NAME"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.name }}
+
+      - name: Publish GitHub Release
+        if: inputs.publish_release == true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: FrameGen ${{ inputs.version_name || github.run_number }} (${{ env.BUILD_TYPE }})
+          prerelease: ${{ inputs.prerelease }}
+          files: ${{ steps.apk.outputs.name }}
